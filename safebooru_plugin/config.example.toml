@@ -1,0 +1,14 @@
+[plugin]
+config_version = "1.0.0"
+enabled = true
+
+[safebooru]
+default_tags = "anime cute"
+max_results = 3
+rating = "safe"
+timeout = 30
+
+[response]
+show_tags = false
+personality_style = "cute"
+enable_natural_search = true
