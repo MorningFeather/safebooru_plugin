@@ -1,2 +1,0 @@
-# safebooru_plugin
-从Safebooru网站搜索并发送动漫图片，支持命令和自然语言交互
