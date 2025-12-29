@@ -4,15 +4,15 @@
   "version": "1.0.0",
   "description": "从Safebooru网站搜索并发送动漫图片，支持命令和自然语言交互",
   "author": {
-    "name": "MaiBot开发团队",
-    "url": "https://github.com/MaiM-with-u"
+    "name": "MorningFeather",
+    "url": "https://github.com/MorningFeather"
   },
   "license": "GPL-v3.0-or-later",
   "host_application": {
     "min_version": "0.8.0"
   },
-  "homepage_url": "https://github.com/MaiM-with-u/maibot",
-  "repository_url": "https://github.com/MaiM-with-u/maibot",
+  "homepage_url": "https://github.com/MorningFeather/safebooru_plugin",
+  "repository_url": "https://github.com/MorningFeather/safebooru_plugin",
   "keywords": [
     "safebooru",
     "anime",
@@ -78,4 +78,5 @@
     "dependencies": []
   },
   "id": "MaiBot开发团队.safebooru_plugin"
+
 }
