@@ -1,5 +1,5 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 1,
   "name": "Safebooru动漫图片搜索插件",
   "version": "2.0.0",
   "description": "从Safebooru网站搜索并发送动漫图片，支持命令和自然语言交互",
@@ -70,3 +70,4 @@
   },
   "id": "MorningFeather.safebooru_plugin"
 }
+
