@@ -11,6 +11,7 @@ from urllib.parse import quote
 import aiohttp
 from PIL import Image
 
+from src.config.config import global_config
 from src.plugin_system import (
     BasePlugin,
     register_plugin,
@@ -33,7 +34,16 @@ class SafebooruAPI:
     """Safebooru API交互类"""
     
     BASE_URL = "https://safebooru.org/index.php"
+    TAG_API_URL = "https://safebooru.org/index.php?page=dapi&s=tag&q=index"
     
+    # 高置信度白名单 (Fast-Path Bypass)
+    FAST_PATH_TAGS = {
+        "shirakami_fubuki", "houshou_marine", "minato_aqua", "usada_pekora",
+        "hatsune_miku", "megurine_luka", "kagamine_rin", "kagamine_len",
+        "hu_tao_(genshin_impact)", "raiden_shogun_(genshin_impact)",
+        "ganyu_(genshin_impact)", "keqing_(genshin_impact)"
+    }
+
     # 关键词映射表
     TAG_MAPPINGS = {
         "猫": "cat",
@@ -70,6 +80,8 @@ class SafebooruAPI:
         "teto": "kasane_teto",
         "灵梦": "hakurei_reimu",
         "魔理沙": "kirisame_marisa",
+        "春日步": "kasuga_ayumu",
+        "大阪": "kasuga_ayumu",
         "芙兰": "flandre_scarlet",
         "蕾米": "remilia_scarlet",
         "爱蜜莉雅": "emilia_(re:zero)",
@@ -164,6 +176,63 @@ class SafebooruAPI:
                 found_tags.add(word)
         
         return ' '.join(list(found_tags))
+
+    @staticmethod
+    async def validate_tags(tags_str: str, timeout_val: int = 15) -> Dict[str, Any]:
+        """
+        VBS 预校验层：对输入关键词进行实体对齐和分类
+        """
+        tags = tags_str.split()
+        results = {
+            "validated_tags": [],
+            "ambiguous_entities": {}, # tag -> [candidates]
+            "low_entropy": False,
+            "fast_path": True
+        }
+        
+        # 弱语义识别
+        weak_semantics = {"girl", "boy", "anime", "solo", "highres", "wallpaper", "cute"}
+        if all(t.lower() in weak_semantics for t in tags):
+            results["low_entropy"] = True
+            results["fast_path"] = False
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_val)) as session:
+            for tag in tags:
+                if tag.lower() in SafebooruAPI.FAST_PATH_TAGS:
+                    results["validated_tags"].append(tag)
+                    continue
+                
+                results["fast_path"] = False
+                # 调用 Tag API 校验
+                url = f"{SafebooruAPI.TAG_API_URL}&name={quote(tag)}&json=1"
+                try:
+                    async with session.get(url) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if not data:
+                                # 模糊匹配尝试
+                                fuzzy_url = f"{SafebooruAPI.TAG_API_URL}&name_pattern={quote(tag)}*&order=count&json=1"
+                                async with session.get(fuzzy_url) as f_resp:
+                                    if f_resp.status == 200:
+                                        f_data = await f_resp.json()
+                                        if f_data:
+                                            # 实体冲突检测：如果匹配到多个热门实体
+                                            candidates = f_data if isinstance(f_data, list) else [f_data]
+                                            # 过滤掉非 ASCII 标签
+                                            candidates = [c for c in candidates if all(ord(char) < 128 for char in c.get('name', ''))]
+                                            if len(candidates) > 1:
+                                                results["ambiguous_entities"][tag] = candidates[:5]
+                                            elif candidates:
+                                                results["validated_tags"].append(candidates[0]['name'])
+                            else:
+                                tag_info = data[0] if isinstance(data, list) else data
+                                results["validated_tags"].append(tag_info['name'])
+                except Exception as e:
+                    logger.error(f"[Safebooru] Tag校验失败 ({tag}): {e}")
+                    # 容错：保留原标签
+                    results["validated_tags"].append(tag)
+        
+        return results
 
     @staticmethod
     async def search_images(tags: str, limit: int = 1, rating: str = "safe", timeout_val: int = 30) -> List[Dict]:
@@ -314,42 +383,113 @@ class SafebooruCommand(BaseCommand):
     # 匹配 /safebooru [标签] 或 /sb [标签]
     command_pattern = r"^(?:/safebooru|/sb)\s*(.*)$"
     
-    async def _send_personality_text(self, raw_text: str, reason: str = "") -> None:
-        """发送符合人格设定的文本"""
+    async def _send_personality_text(self, intent_description: str, context_data: Optional[Dict] = None) -> None:
+        """
+        完全通过人格化逻辑生成并发送文本。
+        不再使用硬编码模板，而是将意图描述和上下文交给 generator_api 处理。
+        """
         try:
+            # 构建一个纯事实的“草稿”，仅作为 LLM 理解意图的参考
+            # 最终输出将完全由 LLM 根据人格设定重写
+            raw_draft = f"[INTENT: {intent_description}]"
+            if context_data:
+                raw_draft += f" [CONTEXT: {json.dumps(context_data, ensure_ascii=False)}]"
+
             success, llm_response = await generator_api.rewrite_reply(
                 chat_stream=self.chat_stream,
-                raw_reply=raw_text,
-                reason=reason or "插件系统提示语人格化",
+                raw_reply=raw_draft,
+                reason=f"Safebooru插件交互: {intent_description}",
                 request_type="safebooru_personality"
             )
             if success and llm_response and llm_response.content:
                 await self.send_text(llm_response.content)
             else:
-                await self.send_text(raw_text)
+                # 降级处理：如果重写失败，至少发送一个基本的意图描述（虽然不理想，但保证了交互不中断）
+                logger.warning(f"[Safebooru] 人格化重写失败，使用降级输出: {intent_description}")
+                await self.send_text(f"（正在处理: {intent_description}）")
         except Exception as e:
             logger.error(f"[Safebooru] 人格化文本生成失败: {e}")
-            await self.send_text(raw_text)
+
+    def _is_explicitly_triggered(self) -> bool:
+        """
+        检查是否满足显式触发条件：
+        1. 消息中包含机器人昵称
+        2. 消息中有 @机器人 (is_mentioned)
+        3. 当前处于已被显式唤醒后的上下文连贯对话中
+        """
+        # 1. 检查 @提及
+        if getattr(self.action_message, 'is_mentioned', False):
+            logger.debug("[Safebooru] 触发校验通过: 检测到 @提及")
+            return True
+            
+        # 2. 检查昵称
+        bot_nickname = global_config.bot.nickname
+        if bot_nickname and bot_nickname in self.action_message.processed_plain_text:
+            logger.debug(f"[Safebooru] 触发校验通过: 检测到昵称 '{bot_nickname}'")
+            return True
+            
+        # 3. 检查上下文连贯性
+        current_time = time.time()
+        last_active = getattr(self.chat_stream, 'last_active_time', 0)
+        if current_time - last_active < 60:
+             logger.debug(f"[Safebooru] 触发校验通过: 检测到活跃上下文 (距离上次活跃 {current_time - last_active:.1f}s)")
+             return True
+
+        return False
 
     async def execute(self) -> Tuple[bool, str, int]:
         """执行Safebooru图片搜索命令"""
         try:
+            # 实施严格的显式触发过滤
+            if not self._is_explicitly_triggered():
+                logger.debug("[Safebooru] 未检测到显式唤醒或有效上下文，插件保持静默")
+                return False, "未显式触发，保持静默", 2
+
             match = re.match(self.command_pattern, self.action_message.processed_plain_text, re.IGNORECASE)
             if not match:
-                await self._send_personality_text("唔...命令格式好像不对呢，要这样用哦：/safebooru [标签]", "告知用户命令格式错误")
+                await self._send_personality_text("告知用户命令格式错误，应为 /safebooru [标签]")
                 return False, "命令格式错误", 2
             
             raw_input = match.group(1).strip()
             tags = SafebooruAPI.extract_tags(raw_input) if raw_input else self.get_config("default_tags", "anime cute")
             
-            # 1. 告知正在搜索 (人格化)
-            await self._send_personality_text(f"正在为你寻找关于 '{tags}' 的图片，请稍等片刻哦~", "告知用户正在搜索图片")
+            # --- VBS 预校验与消歧逻辑 ---
+            vbs_state = getattr(self.chat_stream, 'safebooru_vbs_state', {"count": 0, "pending_tag": None})
+            vbs_results = await SafebooruAPI.validate_tags(tags)
+            
+            if vbs_results["ambiguous_entities"] and vbs_state["count"] < 3:
+                ambiguous_tag = list(vbs_results["ambiguous_entities"].keys())[0]
+                candidates = vbs_results["ambiguous_entities"][ambiguous_tag]
+                vbs_state["count"] += 1
+                vbs_state["pending_tag"] = ambiguous_tag
+                self.chat_stream.safebooru_vbs_state = vbs_state
+                await self._send_personality_text("检测到标签歧义，请求用户澄清", {
+                    "tag": ambiguous_tag,
+                    "candidates": [c['name'] for c in candidates]
+                })
+                return True, f"等待用户消歧: {ambiguous_tag}", 2
+
+            if vbs_results["low_entropy"]:
+                await self._send_personality_text("告知用户语义太弱，请求补充更多特征", {"input": tags})
+                return True, "语义不足，已请求补充", 2
+
+            final_tags = " ".join(vbs_results["validated_tags"])
+            if vbs_state["count"] >= 3:
+                for t, candidates in vbs_results["ambiguous_entities"].items():
+                    final_tags += f" {candidates[0]['name']}"
+                await self._send_personality_text("告知用户由于多次尝试未果，已自动选择最匹配的标签执行搜索", {"tags": final_tags})
+            
+            if hasattr(self.chat_stream, 'safebooru_vbs_state'):
+                del self.chat_stream.safebooru_vbs_state
+
+            # 1. 告知正在搜索 (完全人格化)
+            await self._send_personality_text("收到搜图请求，以自然语气告知用户正在寻找相关图片", {"tags": final_tags})
             
             # 2. 搜索图片
             search_limit = max(self.get_config("max_results", 3) * 3, 10)
             rating = self.get_config("rating", "safe")
             timeout_val = self.get_config("timeout", 30)
-            images = await SafebooruAPI.search_images(tags, search_limit, rating, timeout_val)
+            images = await SafebooruAPI.search_images(final_tags, search_limit, rating, timeout_val)
             
             if images:
                 # 3. 随机选择并下载
@@ -362,35 +502,24 @@ class SafebooruCommand(BaseCommand):
                         # 4. 发送图片
                         success = await self.send_image(image_base64)
                         if success:
-                            # 5. 发送人格化描述 (合并搜到和描述)
-                            response_text = self._generate_response(selected_image, tags)
-                            await self._send_personality_text(response_text, "发送图片描述")
+                            # 5. 成功发送图片后，不再主动发送人格化描述，交由主大脑处理
                             return True, f"成功发送图片: {tags}", 2
                         else:
-                            await self._send_personality_text("唔...图片发不出去，是不是文件太大了呀？要我再试一次吗？", "告知发送失败并询问重试")
+                            await self._send_personality_text("告知图片发送失败（可能文件过大）并询问是否重试")
                     else:
-                        await self._send_personality_text("下载图片的时候出了一点小意外，要我再试一次吗？", "告知下载失败并询问重试")
+                        await self._send_personality_text("告知图片下载失败并询问是否重试")
                 else:
-                    await self._send_personality_text("这张图片的链接好像失效了，要我再试一次吗？", "告知链接失效并询问重试")
+                    await self._send_personality_text("告知图片链接失效并询问是否重试")
             else:
-                await self._send_personality_text(f"没找到关于 '{tags}' 的图，要换个标签或者让我再试一次吗？", "告知未找到并询问重试")
+                # 搜索失败时，不再主动发送人格化描述，交由主大脑处理
+                pass
             
             return True, "执行完毕，等待用户反馈", 2
                 
         except Exception as e:
             logger.error(f"[SafebooruCommand] 执行错误: {e}")
-            await self._send_personality_text("唔... 麦麦刚才走神了，没能完成搜索。要我再试一次吗？", "告知发生未知错误并询问重试")
+            await self._send_personality_text("告知发生未知错误导致搜索中断，并询问是否重试")
             return True, f"执行错误: {e}", 2
-    
-    def _generate_response(self, image_info: Dict, search_tags: str) -> str:
-        """生成人格化回复"""
-        responses = [
-            "找到图片了，觉得怎么样？",
-            "你要的图片找来啦，快看看喜不喜欢！",
-            "搜到啦！这张图片你觉得如何？",
-            "图片来咯，希望你会喜欢呀~"
-        ]
-        return random.choice(responses)
 
 
 class SafebooruAction(BaseAction):
@@ -409,31 +538,69 @@ class SafebooruAction(BaseAction):
     ]
     associated_types = ["text"]
     
-    async def _send_personality_text(self, raw_text: str, reason: str = "") -> None:
-        """发送符合人格设定的文本"""
+    async def _send_personality_text(self, intent_description: str, context_data: Optional[Dict] = None) -> None:
+        """
+        完全通过人格化逻辑生成并发送文本。
+        不再使用硬编码模板，而是将意图描述和上下文交给 generator_api 处理。
+        """
         try:
+            raw_draft = f"[INTENT: {intent_description}]"
+            if context_data:
+                raw_draft += f" [CONTEXT: {json.dumps(context_data, ensure_ascii=False)}]"
+
             success, llm_response = await generator_api.rewrite_reply(
                 chat_stream=self.chat_stream,
-                raw_reply=raw_text,
-                reason=reason or "插件系统提示语人格化",
+                raw_reply=raw_draft,
+                reason=f"Safebooru插件交互: {intent_description}",
                 request_type="safebooru_personality"
             )
             if success and llm_response and llm_response.content:
                 await self.send_text(llm_response.content)
             else:
-                await self.send_text(raw_text)
+                logger.warning(f"[Safebooru] 人格化重写失败，使用降级输出: {intent_description}")
+                await self.send_text(f"（正在处理: {intent_description}）")
         except Exception as e:
             logger.error(f"[Safebooru] 人格化文本生成失败: {e}")
-            await self.send_text(raw_text)
+
+    def _is_explicitly_triggered(self) -> bool:
+        """
+        检查是否满足显式触发条件：
+        1. 消息中包含机器人昵称
+        2. 消息中有 @机器人 (is_mentioned)
+        3. 当前处于已被显式唤醒后的上下文连贯对话中
+        """
+        # 1. 检查 @提及
+        if getattr(self.action_message, 'is_mentioned', False):
+            logger.debug("[Safebooru] 触发校验通过: 检测到 @提及")
+            return True
+            
+        # 2. 检查昵称
+        bot_nickname = global_config.bot.nickname
+        if bot_nickname and bot_nickname in self.action_message.processed_plain_text:
+            logger.debug(f"[Safebooru] 触发校验通过: 检测到昵称 '{bot_nickname}'")
+            return True
+            
+        # 3. 检查上下文连贯性
+        # 如果最近 60 秒内该聊天流有活跃记录，认为处于连贯对话中
+        current_time = time.time()
+        last_active = getattr(self.chat_stream, 'last_active_time', 0)
+        if current_time - last_active < 60:
+             logger.debug(f"[Safebooru] 触发校验通过: 检测到活跃上下文 (距离上次活跃 {current_time - last_active:.1f}s)")
+             return True
+
+        return False
 
     async def execute(self) -> Tuple[bool, str]:
         """执行智能图片搜索"""
         try:
+            # 实施严格的显式触发过滤
+            if not self._is_explicitly_triggered():
+                logger.debug("[Safebooru] 未检测到显式唤醒或有效上下文，插件保持静默")
+                return False, "未显式触发，保持静默"
+
             # 获取消息文本
             message_text = self.action_message.processed_plain_text.lower()
             
-            # 移除内部的群聊明确性校验，信任 Planner 的判断
-
             # 提取标签
             raw_tags = ""
             if hasattr(self, 'action_data') and self.action_data:
@@ -442,21 +609,49 @@ class SafebooruAction(BaseAction):
             if not raw_tags:
                 raw_tags = SafebooruAPI.extract_tags(message_text)
             else:
-                # 如果 LLM 已经提供了标签，我们也尝试进行一次映射转换（处理可能存在的中文或需要下划线的情况）
                 mapped_tags = SafebooruAPI.extract_tags(raw_tags)
                 if mapped_tags:
                     raw_tags = mapped_tags
             
             search_tags = raw_tags or self.get_config("default_tags", "anime cute")
             
-            # 1. 告知正在搜图 (人格化)
-            await self._send_personality_text(f"收到啦！正在为你寻找关于 '{search_tags}' 的图片，请稍等哦~", "告知用户正在找图")
+            # --- VBS 预校验与消歧逻辑 ---
+            vbs_state = getattr(self.chat_stream, 'safebooru_vbs_state', {"count": 0, "pending_tag": None})
+            vbs_results = await SafebooruAPI.validate_tags(search_tags)
+            
+            if vbs_results["ambiguous_entities"] and vbs_state["count"] < 3:
+                ambiguous_tag = list(vbs_results["ambiguous_entities"].keys())[0]
+                candidates = vbs_results["ambiguous_entities"][ambiguous_tag]
+                vbs_state["count"] += 1
+                vbs_state["pending_tag"] = ambiguous_tag
+                self.chat_stream.safebooru_vbs_state = vbs_state
+                await self._send_personality_text("检测到标签歧义，请求用户澄清", {
+                    "tag": ambiguous_tag,
+                    "candidates": [c['name'] for c in candidates]
+                })
+                return True, f"等待用户消歧: {ambiguous_tag}"
+
+            if vbs_results["low_entropy"]:
+                await self._send_personality_text("告知用户语义太弱，请求补充更多特征", {"input": search_tags})
+                return True, "语义不足，已请求补充"
+
+            final_tags = " ".join(vbs_results["validated_tags"])
+            if vbs_state["count"] >= 3:
+                for t, candidates in vbs_results["ambiguous_entities"].items():
+                    final_tags += f" {candidates[0]['name']}"
+                await self._send_personality_text("告知用户由于多次尝试未果，已自动选择最匹配的标签执行搜索", {"tags": final_tags})
+            
+            if hasattr(self.chat_stream, 'safebooru_vbs_state'):
+                del self.chat_stream.safebooru_vbs_state
+
+            # 1. 告知正在搜图 (完全人格化)
+            await self._send_personality_text("收到搜图请求，以自然语气告知用户正在寻找相关图片", {"tags": final_tags})
             
             # 2. 搜索图片
             search_limit = max(self.get_config("max_results", 3) * 3, 10)
             rating = self.get_config("rating", "safe")
             timeout_val = self.get_config("timeout", 30)
-            images = await SafebooruAPI.search_images(search_tags, search_limit, rating, timeout_val)
+            images = await SafebooruAPI.search_images(final_tags, search_limit, rating, timeout_val)
             
             if images:
                 selected_image = random.choice(images)
@@ -468,11 +663,8 @@ class SafebooruAction(BaseAction):
                         # 3. 发送图片
                         success = await self.send_image(image_base64)
                         if success:
-                            # 4. 发送人格化描述
-                            response_text = self._generate_natural_response(message_text, selected_image, search_tags)
-                            await self._send_personality_text(response_text, "发送图片描述")
-                            
-                            # 5. 记录 Action 信息，使用强终止语约束 Planner
+                            # 4. 记录 Action 信息，使用强终止语约束 Planner
+                            # 成功发送图片后，不再主动发送人格化描述，交由主大脑处理
                             await self.store_action_info(
                                 action_build_into_prompt=True,
                                 action_prompt_display=f"已成功发送关于 '{search_tags}' 的图片。任务已完成。除非用户明确要求再次搜索或更换标签，否则严禁自动重试或继续搜索相关内容。",
@@ -480,25 +672,26 @@ class SafebooruAction(BaseAction):
                             )
                             return True, f"成功发送图片: {search_tags}"
                         else:
-                            await self._send_personality_text("唔...图片发不出去，可能是太大了，要我再试一次吗？", "告知发送失败并询问重试")
+                            await self._send_personality_text("告知图片发送失败（可能文件过大）并询问是否重试")
                     else:
-                        await self._send_personality_text("下载图片的时候失败了，要我再试一次吗？", "告知下载失败并询问重试")
+                        await self._send_personality_text("告知图片下载失败并询问是否重试")
                 else:
-                    await self._send_personality_text("这张图片的链接好像失效了，要我再试一次吗？", "告知链接失效并询问重试")
+                    await self._send_personality_text("告知图片链接失效并询问是否重试")
             else:
-                await self._send_personality_text(f"没找到关于 '{search_tags}' 的图，要换个标签或者让我再试一次吗？", "告知未找到并询问重试")
+                # 搜索失败时，不再主动发送人格化描述，交由主大脑处理
+                pass
             
             # 失败或未找到时也记录信息，防止 Planner 自动重试
             await self.store_action_info(
                 action_build_into_prompt=True,
-                action_prompt_display=f"尝试搜索 '{search_tags}' 但未找到结果或下载失败。已询问用户是否重试。在用户回复之前，不要进行任何自动搜索。",
+                action_prompt_display=f"尝试搜索 '{search_tags}' 但未找到结果或下载失败。请告知用户结果并询问是否重试。在用户回复之前，不要进行任何自动搜索。",
                 action_done=True
             )
             return True, "搜索未成功，已询问用户"
                 
         except Exception as e:
             logger.error(f"[SafebooruAction] 执行错误: {e}")
-            await self._send_personality_text("唔... 麦麦刚才走神了，没能完成搜索。要我再试一次吗？", "告知发生未知错误并询问重试")
+            await self._send_personality_text("告知发生未知错误导致搜索中断，并询问是否重试")
             # 即使发生异常也记录 action_done，防止 Planner 陷入错误修复循环
             await self.store_action_info(
                 action_build_into_prompt=True,
@@ -506,17 +699,6 @@ class SafebooruAction(BaseAction):
                 action_done=True
             )
             return True, f"执行错误: {e}"
-    
-    
-    def _generate_natural_response(self, message_text: str, image_info: Dict, search_tags: str) -> str:
-        """生成自然语言回复"""
-        responses = [
-            "找到图片了，觉得怎么样？",
-            "你要的图片找来啦，快看看喜不喜欢！",
-            "搜到啦！这张图片你觉得如何？",
-            "图片来咯，希望你会喜欢呀~"
-        ]
-        return random.choice(responses)
 
 
 class SafebooruTool(BaseTool):
@@ -544,9 +726,28 @@ class SafebooruTool(BaseTool):
                     "success": False
                 }
             
+            # --- VBS 预校验层 ---
+            vbs_results = await SafebooruAPI.validate_tags(tags)
+            
+            if vbs_results["ambiguous_entities"]:
+                ambiguous_tag = list(vbs_results["ambiguous_entities"].keys())[0]
+                candidates = [c['name'] for c in vbs_results["ambiguous_entities"][ambiguous_tag]]
+                return {
+                    "content": f"⚠️ 标签 '{ambiguous_tag}' 存在歧义，请从以下建议中选择更具体的标签：{', '.join(candidates)}",
+                    "success": False,
+                    "ambiguity": vbs_results["ambiguous_entities"]
+                }
+
+            if vbs_results["low_entropy"]:
+                return {
+                    "content": f"⚠️ 标签 '{tags}' 语义太弱（如 girl, solo 等），请提供更具体的特征（如角色名、作品名或具体的服装描述）。",
+                    "success": False
+                }
+
+            final_tags = " ".join(vbs_results["validated_tags"])
+            
             # 搜索图片
-            # Tool 组件可能没有 get_config，这里使用默认值或从参数获取
-            images = await SafebooruAPI.search_images(tags, limit, rating, 30)
+            images = await SafebooruAPI.search_images(final_tags, limit, rating, 30)
             
             if not images:
                 return {
